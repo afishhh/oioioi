@@ -8,7 +8,14 @@ from django.urls import resolve, reverse
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
-from mistune.plugins.table import NP_TABLE_PATTERN, TABLE_PATTERN, table
+from mistune.plugins.table import (
+    NP_TABLE_PATTERN,
+    TABLE_PATTERN,
+    render_table_body,
+    render_table_cell,
+    render_table_head,
+    render_table_row,
+)
 from mistune.util import safe_entity, unescape
 
 from oioioi.contests.models import UserResultForProblem
@@ -29,9 +36,26 @@ _table_aligns = [
     ("right", re.compile(r"^ *-+: *$")),
     (None, re.compile(r"^ *-* *$")),
 ]
+_link_pattern = re.compile(mistune.InlineParser.SPECIFICATION["link"])
+
+
+class WidgetError(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
 
 
 class PortalRenderer(mistune.HTMLRenderer):
+    def __init__(self, request):
+        super().__init__(escape=True)
+        self.request = request
+        # Since we don't associate the renderer with our parser the table
+        # plugin can't add its render functions itself.
+        self.register("table_head", render_table_head)
+        self.register("table_body", render_table_body)
+        self.register("table_row", render_table_row)
+        self.register("table_cell", render_table_cell)
+
     def text(self, text):
         # Keep HTML entities written by authors (e.g. &nbsp;) working, as in mistune 0.8.
         return safe_entity(text)
@@ -54,9 +78,14 @@ class PortalRenderer(mistune.HTMLRenderer):
         """
         return render_to_string("portals/widgets/table.html", {"content": mark_safe(text)})
 
-    def portal_widget(self, text):
-        # Already rendered by the widget, must not be escaped.
-        return text
+    def portal_widget(self, text, widget):
+        m = widget.param_regex.match(text)
+        try:
+            if not m:
+                raise WidgetError("invalid syntax")
+            return widget.render(self.request, m)
+        except WidgetError as e:
+            return f'<span class="text-danger">[[{widget.name}: {mistune.escape(e.message)}]]</span>'
 
 
 def _search_cached(state, pattern, pos):
@@ -116,28 +145,48 @@ def parse_block_spoiler(block, m, state):
     return m.end()
 
 
+def _find_closing_brackets(text: str, start: int):
+    current = start
+    depth = 0
+    while current < len(text) - 1:
+        next_end = text.find("]]", current)
+        next_open = text.find("[[", current, None if next_end < 0 else next_end)
+        if next_end == -1:
+            return None
+        if next_open != -1:
+            current = next_open + 2
+            depth += 1
+        else:
+            if depth == 0:
+                return next_end
+            current = next_end + 2
+            depth -= 1
+
+    return None
+
+
+def _is_valid_widget_name(text: str):
+    return all(c.isalnum() or c in "_-" for c in text)
+
+
 def _split_table_cells(text):
     """Split a table row at ``|``, except escaped ones and ones inside widget tags like ``[[YouTube|...]]``."""
     cells = []
     start = pos = 0
-    in_tag = False
-    last_tag_end = text.rfind("]]")
+
     while pos < len(text):
-        if text[pos] == "\\":
+        if text.startswith("[[", pos):
+            end = _find_closing_brackets(text, pos + 2)
+            pos = (end or pos) + 2
+        elif text[pos] == "\\":
             pos += 2
-            continue
-        if not in_tag and text.startswith("[[", pos) and pos < last_tag_end:
-            in_tag = True
-            pos += 2
-            continue
-        if in_tag and text.startswith("]]", pos):
-            in_tag = False
-            pos += 2
-            continue
-        if text[pos] == "|" and not in_tag:
+        elif text[pos] == "|":
             cells.append(text[start:pos].strip())
             start = pos + 1
-        pos += 1
+            pos += 1
+        else:
+            pos += 1
+
     cells.append(text[start:].strip())
     return cells
 
@@ -203,13 +252,12 @@ def table_plugin(md):
 
     mistune 3 drops the whole table when a row has a different number of cells than the header.
     """
-    table(md)
     md.block.register("table", TABLE_PATTERN, _make_table_parser(_strip_pipe_table_row))
     md.block.register("nptable", NP_TABLE_PATTERN, _make_table_parser(_strip_nptable_row))
 
 
 _markdown = mistune.create_markdown(
-    renderer=PortalRenderer(escape=True),
+    renderer=None,
     plugins=["strikethrough", "footnotes", table_plugin, "url"],
 )
 _block_rules = {
@@ -228,9 +276,9 @@ for _name, (_pattern, _func) in _block_rules.items():
 
 
 def render_panel(request, panel):
-    state = _markdown.block.state_cls()
-    state.env["request"] = request
-    html, _ = _markdown.parse(panel, state)
+    tokens, state = _markdown.parse(panel)
+    assert isinstance(tokens, list)
+    html = PortalRenderer(request).render_tokens(tokens, state)
     return html
 
 
@@ -241,54 +289,47 @@ def register_widget(widget):
     and takes precedence over links and the other inline rules.
 
     :type widget: object containing the following:
-        * :attr:`widget.name` - name of the widget, unique among inline rules
-        * :attr:`widget.compiled_tag_regex` - compiled regular expression
-            pattern used for identifying markdown tag.  Its pattern is
-            embedded into ``mistune``'s combined regex, so it must not use
-            ``^`` anchors, flags (also inline ones) or named groups.
+        * :attr:`widget.name` - name of the widget, unique among inline rules.
+            Will be used as the keyword when looking for matching tags.
+        * :attr:`widget.param_regex` - compiled regular expression
+            pattern used for parsing tag contents before rendering.
         * :meth:`widget.render` - method (or just function) accepting
             the current request and the corresponding :class:`re.Match`
             instance (named 'm').  Should return a string (rendered widget).
+            May throw WidgetError to show a simple user-visible error.
     """
-    if widget.name in _markdown.inline.rules or any(w.name == widget.name for w in REGISTERED_WIDGETS):
-        raise ValueError(f"Inline tag for widget named {widget.name} has already been registered.")
-
-    # Fail here rather than on every later render if the pattern can't be
-    # embedded into the combined regex (see compile_sc in mistune).
-    inline = _markdown.inline
-    pattern = widget.compiled_tag_regex.pattern
-    # Only the pattern goes into the combined regex, so flags would be silently lost.
-    if widget.compiled_tag_regex.flags & ~re.UNICODE:
-        raise ValueError(f"Inline tag for widget named {widget.name} must not use regex flags.")
-    patterns = {**inline.specification, widget.name: pattern}
-    try:
-        re.compile("|".join(f"(?P<{name}>{patterns[name]})" for name in [*inline.rules, widget.name]), inline.sc_flag)
-    except re.error as e:
-        raise ValueError(f"Invalid inline tag for widget named {widget.name}: {e}") from e
+    if not _is_valid_widget_name(widget.name):
+        raise ValueError(f"Invalid widget name {widget.name}")
+    if any(widget.name == w.name for w in REGISTERED_WIDGETS):
+        raise ValueError(f"Widget named {widget.name} has already been registered")
 
     def parse(inline, m, state):
-        # Match again on its own, so that group numbers are the widget's
-        # and not the ones from the combined regex.
-        widget_match = widget.compiled_tag_regex.match(state.src, m.start())
-        if widget_match is None:
-            return None
-        state.append_token({"type": "portal_widget", "raw": widget.render(state.env["request"], widget_match)})
-        return widget_match.end()
+        # Fallback to parsing as a link if the start does not look like a proper tag.
+        if m.end() == len(state.src) or _is_valid_widget_name(state.src[m.start() : m.end() + 1]):
+            return inline.parse_link(_link_pattern.match(state.src, m.start()), state)
 
-    _markdown.inline.register(widget.name, pattern, parse, before="link")
+        end = _find_closing_brackets(state.src, m.end())
+        if end is None:
+            return None
+
+        state.append_token({"type": "portal_widget", "attrs": {"widget": widget}, "raw": state.src[m.start() + 2 : end]})
+        return end + 2
+
+    pattern = rf"\[\[{widget.name}"
+    parser_name = f"portal_widget{len(REGISTERED_WIDGETS)}"
+    _markdown.inline.register(parser_name, pattern, parse, before="link")
 
     REGISTERED_WIDGETS.append(widget)
 
 
 class YouTubeWidget:
-    name = "youtube"
-    compiled_tag_regex = re.compile(
-        r"\[\[" r"YouTube\|((?:[^\[\]]|\[[^\[\]]*\])+)" r"\]\](?!\])"  # [[  # YouTube|<url>  # ]]
-    )
+    name = "YouTube"
+    # YouTube|<url> or YouTube|<title>|<url>
+    param_regex = re.compile(r"YouTube\|(?:[^|\n]*\|)?([^\n]*)")
 
-    def render(self, request, m):
+    def render(self, _request, m):
         # 'https://www.youtube.com/watch?v=dVDk7PXNXB8'
-        youtube_url = m.group(1).split("|")[-1].strip()
+        youtube_url = m.group(1)
         # We must use the embed player, so if user just copies link
         # from the browser when he is on YT, we must transform
         # the link in order to be able to play the movie
@@ -306,14 +347,9 @@ register_widget(YouTubeWidget())
 
 
 class ProblemTableWidget:
-    name = "problem_table"
-    compiled_tag_regex = re.compile(
-        r"\[\["  # [[
-        # ProblemTable|... or ProblemTable:<Header>|...
-        # The parts can't contain brackets, so that a tag without ]] fails fast.
-        r"ProblemTable(:[^\[\]|\n]*)?\|([^\[\]\n]*)"
-        r"\]\](?!\])"  # ]]
-    )
+    name = "ProblemTable"
+    # ProblemTable|... or ProblemTable:<Header>|...
+    param_regex = re.compile(r"ProblemTable(:[^|\n]*)?\|([^\n]*)")
 
     @staticmethod
     def site_key_from_link(link):
@@ -386,18 +422,38 @@ class ProblemTableWidget:
 register_widget(ProblemTableWidget())
 
 
+def collect_problems(panel):
+    """Parse panel content and return a list of accessible problems."""
+
+    tokens, _ = _markdown.parse(panel)
+    assert isinstance(tokens, list)
+
+    def walk_tokens(tokens, result):
+        for token in tokens:
+            if token["type"] == "portal_widget" and hasattr(widget := token["attrs"]["widget"], "get_problem_ids"):
+                m = widget.param_regex.match(token["raw"])
+                if m is not None:
+                    result += widget.get_problem_ids(m)
+            elif children := token.get("children", None):
+                walk_tokens(children, result)
+
+    result = []
+    walk_tokens(tokens, result)
+
+    return result
+
+
 class RedirectWidget:
-    name = "redirect"
-    compiled_tag_regex = re.compile(
-        r"\[\[" r"Redirect\|([^\[\]\n]*)" r"\]\]"  # [[  # Redirect|<url>  # ]]
-    )
+    name = "Redirect"
+    # Redirect|<url>
+    param_regex = re.compile(r"Redirect\|([^\n]*)")
 
     @staticmethod
     def render(request, match):
         redirect_url = match.group(1).strip()
         # Rejects other hosts (also "//host" and "/\host") and schemes such as javascript:.
         if not url_has_allowed_host_and_scheme(redirect_url, allowed_hosts=None):
-            return "[[Redirect: only relative URLs allowed]]"
+            raise WidgetError("only relative URLs allowed")
 
         return render_to_string(
             "portals/widgets/redirect.html",
