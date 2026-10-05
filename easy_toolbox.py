@@ -19,13 +19,13 @@ import os
 import sys
 from shlex import quote
 
-if sys.platform == "win32":
-    # for Windows, a different syntax command_prefix is needed
-    command_prefix = "set OIOIOI_UID=1000 &&"
-else:
-    command_prefix = "OIOIOI_UID=$(id -u)"
+if not os.environ.get("OIOIOI_UID", None):
+    uid = "1000"
+    if os.name == "posix":
+        uid = os.environ.get("SUDO_UID", str(os.getuid()))
+    os.environ["OIOIOI_UID"] = uid
 
-BASE_DOCKER_COMMAND = f"{command_prefix} docker compose -f docker-compose-dev.yml"
+BASE_DOCKER_COMMAND = "docker compose -f docker-compose-dev.yml"
 
 RAW_COMMANDS = [
     (
