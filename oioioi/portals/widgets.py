@@ -1,5 +1,6 @@
 import re
 import urllib.parse
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import mistune
@@ -155,20 +156,45 @@ def parse_block_spoiler(block, m, state):
     return m.end()
 
 
-def _find_closing_brackets(text: str, start: int):
+@dataclass(slots=True)
+class _BracketMatchingState:
+    @dataclass(frozen=True, slots=True)
+    class Group:
+        opening_start: int
+        closing_start: int
+
+    pending_groups: list[Group] = field(default_factory=list)
+    no_endings_left: bool = False
+
+
+def _find_closing_brackets(text: str, start: int, bstate: _BracketMatchingState):
     """Find the matching closing brackets for a pair of opening brackets at ``start`` in ``text``."""
 
+    while len(bstate.pending_groups) > 0:
+        if bstate.pending_groups[-1].opening_start < start:
+            bstate.pending_groups.pop()
+        elif bstate.pending_groups[-1].opening_start == start:
+            return bstate.pending_groups[-1].closing_start
+        else:
+            return None
+    if bstate.no_endings_left:
+        return None
+
+    stack: list[int] = []
     current = start
     depth = 0
     while current < len(text) - 1:
         next_end = text.find("]]", current)
         next_open = text.find("[[", current, None if next_end < 0 else next_end)
         if next_end == -1:
+            bstate.no_endings_left = True
             return None
         if next_open != -1:
+            stack.append(next_open)
             current = next_open + 2
             depth += 1
         else:
+            bstate.pending_groups.append(_BracketMatchingState.Group(stack.pop(), next_end))
             if depth == 0:
                 return next_end
             current = next_end + 2
@@ -185,10 +211,11 @@ def _split_table_cells(text):
     """Split a table row at ``|``, except escaped ones and ones inside widget tags like ``[[YouTube|...]]``."""
     cells = []
     start = pos = 0
+    bracket_state = _BracketMatchingState()
 
     while pos < len(text):
         if text.startswith("[[", pos):
-            end = _find_closing_brackets(text, pos + 2)
+            end = _find_closing_brackets(text, pos + 2, bracket_state)
             pos = (end or pos) + 2
         elif text[pos] == "\\":
             pos += 2
@@ -323,7 +350,8 @@ def register_widget(widget: Widget):
         if m.end() == len(state.src) or _is_valid_widget_name(state.src[m.start() : m.end() + 1]):
             return inline.parse_link(_link_pattern.match(state.src, m.start()), state)
 
-        end = _find_closing_brackets(state.src, m.end())
+        bstate: _BracketMatchingState = state.__dict__.setdefault("_portal_bracket_state", _BracketMatchingState())
+        end = _find_closing_brackets(state.src, m.end(), bstate)
         if end is None:
             return None
 

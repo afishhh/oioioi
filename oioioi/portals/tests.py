@@ -531,8 +531,7 @@ class TestMarkdown(TestCase):
         for tag in ["[[YouTube|", "[[Redirect|", "[[ProblemTable|", "[[ProblemTable:"]:
             start = time.perf_counter()
             render_panel(self.request, tag * 20000)
-            # About 0.2 s now; the old quadratic patterns took 10 s or more.
-            self.assertLess(time.perf_counter() - start, 5, tag)
+            self.assertLess(time.perf_counter() - start, 0.5, tag)
 
     def test_youtube_widget_title_with_brackets(self):
         rendered = render_panel(self.request, "[[YouTube|Final [HD]|https://www.youtube.com/watch?v=pB0CTz5QlOw]]")
