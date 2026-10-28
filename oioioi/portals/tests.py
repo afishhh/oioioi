@@ -533,6 +533,24 @@ class TestMarkdown(TestCase):
             render_panel(self.request, tag * 20000)
             self.assertLess(time.perf_counter() - start, 0.5, tag)
 
+    def test_widget_bracket_matching(self):
+        class EchoWidget:
+            name = "Echo"
+            param_regex = re.compile(r"Echo\|(.*)")
+
+            def render(self, _request, m):
+                return m.group(1)
+
+        register_widget(EchoWidget())
+
+        rendered = render_panel(self.request, "[[Echo](https://example.com)][[[[Echo|[[brackets [[and more]] here]]]]")
+        self.assertIn(r"[<a", rendered)
+        self.assertIn("</a>][[[[brackets [[and more]] here]]</p>", rendered)
+
+        rendered = render_panel(self.request, "[[Echo[[][[[[Echo|[[brackets [[and more]] here]]]]")
+        self.assertIn(r"[[Echo[[]", rendered)
+        self.assertIn("][[[[brackets [[and more]] here]]</p>", rendered)
+
     def test_youtube_widget_title_with_brackets(self):
         rendered = render_panel(self.request, "[[YouTube|Final [HD]|https://www.youtube.com/watch?v=pB0CTz5QlOw]]")
         self.assertIn('<iframe src="https://www.youtube.com/embed/pB0CTz5QlOw"', rendered)

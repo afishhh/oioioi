@@ -164,9 +164,12 @@ class _BracketMatchingState:
         closing_start: int
 
     pending_groups: list[Group] = field(default_factory=list)
-    no_endings_left: bool = False
+    processed_until: int = 0
 
 
+# This is actually similar to what mistune does internally for parsing links but to use
+# that we'd have to make the table parser parse inline content when splitting cells
+# along with being fine with parsing widget content once as markdown before realising it's a widget.
 def _find_closing_brackets(text: str, start: int, bstate: _BracketMatchingState):
     """Find the matching closing brackets for a pair of opening brackets at ``start`` in ``text``."""
 
@@ -177,29 +180,56 @@ def _find_closing_brackets(text: str, start: int, bstate: _BracketMatchingState)
             return bstate.pending_groups[-1].closing_start
         else:
             return None
-    if bstate.no_endings_left:
+    if bstate.processed_until > start:
         return None
 
-    stack: list[int] = []
-    current = start
-    depth = 0
-    while current < len(text) - 1:
-        next_end = text.find("]]", current)
-        next_open = text.find("[[", current, None if next_end < 0 else next_end)
-        if next_end == -1:
-            bstate.no_endings_left = True
-            return None
-        if next_open != -1:
-            stack.append(next_open)
-            current = next_open + 2
-            depth += 1
-        else:
-            bstate.pending_groups.append(_BracketMatchingState.Group(stack.pop(), next_end))
-            if depth == 0:
-                return next_end
-            current = next_end + 2
-            depth -= 1
+    @dataclass(slots=True)
+    class BracketRun:
+        start: int
+        count: int = 1
 
+        @property
+        def end(self):
+            return self.start + self.count
+
+    stack: list[BracketRun] = [BracketRun(start, 2)]
+    next_end = -1
+    current = start + 2
+    while current < len(text) - 1:
+        if next_end < current:
+            next_end = text.find("]", current)
+        next_open = text.find("[", current, None if next_end == -1 else next_end)
+
+        if next_end == -1:
+            current = len(text)
+            break
+
+        last = stack[-1]
+        if next_open != -1:
+            current = next_open + 1
+            if last.end == next_open:
+                last.count += 1
+            else:
+                stack.append(BracketRun(next_open))
+        else:
+            current = next_end + 1
+            last.count -= 1
+
+            is_double_end = False
+            if text.startswith("]", current) and last.count > 0:
+                current += 1
+                last.count -= 1
+
+                bstate.pending_groups.append(_BracketMatchingState.Group(last.end, next_end))
+                is_double_end = True
+
+            if last.count == 0:
+                stack.pop()
+            if len(stack) == 0:
+                bstate.processed_until = current
+                return next_end if is_double_end else None
+
+    bstate.processed_until = current
     return None
 
 
@@ -215,7 +245,7 @@ def _split_table_cells(text):
 
     while pos < len(text):
         if text.startswith("[[", pos):
-            end = _find_closing_brackets(text, pos + 2, bracket_state)
+            end = _find_closing_brackets(text, pos, bracket_state)
             pos = (end or pos) + 2
         elif text[pos] == "\\":
             pos += 2
@@ -351,7 +381,7 @@ def register_widget(widget: Widget):
             return inline.parse_link(_link_pattern.match(state.src, m.start()), state)
 
         bstate: _BracketMatchingState = state.__dict__.setdefault("_portal_bracket_state", _BracketMatchingState())
-        end = _find_closing_brackets(state.src, m.end(), bstate)
+        end = _find_closing_brackets(state.src, m.start(), bstate)
         if end is None:
             return None
 
