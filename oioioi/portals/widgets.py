@@ -1,5 +1,6 @@
 import re
 import urllib.parse
+from typing import Protocol, runtime_checkable
 
 import mistune
 from django.http import Http404
@@ -46,6 +47,14 @@ class WidgetError(Exception):
         self.message = message
 
 
+@runtime_checkable
+class Widget(Protocol):
+    name: str
+    param_regex: re.Pattern[str]
+
+    def render(self, request, match: re.Match[str], /) -> str: ...
+
+
 class PortalRenderer(mistune.HTMLRenderer):
     def __init__(self, request):
         super().__init__(escape=True)
@@ -79,7 +88,7 @@ class PortalRenderer(mistune.HTMLRenderer):
         """
         return render_to_string("portals/widgets/table.html", {"content": mark_safe(text)})
 
-    def portal_widget(self, text, widget):
+    def portal_widget(self, text, widget: Widget):
         m = widget.param_regex.match(text)
         try:
             if not m:
@@ -147,6 +156,8 @@ def parse_block_spoiler(block, m, state):
 
 
 def _find_closing_brackets(text: str, start: int):
+    """Find the matching closing brackets for a pair of opening brackets at ``start`` in ``text``."""
+
     current = start
     depth = 0
     while current < len(text) - 1:
@@ -284,7 +295,7 @@ def render_panel(request, panel):
     return html
 
 
-def register_widget(widget):
+def register_widget(widget: Widget):
     """
     Register markdown tag for a portal widget.
     The tag is added as an inline rule of the ``mistune`` 3 parser
@@ -300,6 +311,8 @@ def register_widget(widget):
             instance (named 'm').  Should return a string (rendered widget).
             May throw WidgetError to show a simple user-visible error.
     """
+    if not isinstance(widget, Widget):
+        raise ValueError("Widget has incorrect shape")
     if not _is_valid_widget_name(widget.name):
         raise ValueError(f"Invalid widget name {widget.name}")
     if any(widget.name == w.name for w in REGISTERED_WIDGETS):
