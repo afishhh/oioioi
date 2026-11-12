@@ -808,10 +808,17 @@ ZEUS_RETRY_SLEEP = 1  # second
 # COMPLAINTS_SUBJECT_PREFIX = '[oioioi-complaints] '
 
 # Cache
+# CACHES = {
+#     'default': {
+#         'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
+#         'LOCATION': os.path.join(tempfile.gettempdir(), 'oioioi-cache')
+#     }
+# }
+
 CACHES = {
     'default': {
-        'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
-        'LOCATION': os.path.join(tempfile.gettempdir(), 'oioioi-cache')
+        'BACKEND': 'oioioi.base.cache.FaultTolerantPyLibMCCache',
+        # 'LOCATION': os.path.join(tempfile.gettempdir(), 'oioioi-cache')
     }
 }
 
